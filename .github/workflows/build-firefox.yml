@@ -1,0 +1,46 @@
+name: Build Firefox
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Clone upstream
+        run: git clone --depth 1 https://github.com/violentmonkey/violentmonkey upstream
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'yarn'
+          cache-dependency-path: upstream/yarn.lock
+
+      - name: Install dependencies
+        working-directory: upstream
+        run: yarn
+
+      - name: Apply patch (Firefox container id)
+        run: node tools/patch_firefox_container_ast.mjs upstream
+
+      - name: Build
+        working-directory: upstream
+        run: |
+          yarn build
+
+      - name: Pack
+        working-directory: upstream
+        run: |
+          cd dist
+          zip -r ../violentmonkey-firefox.zip .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: violentmonkey-firefox
+          path: upstream/violentmonkey-firefox.zip
+          if-no-files-found: error
