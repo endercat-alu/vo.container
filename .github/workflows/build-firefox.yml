@@ -2,17 +2,129 @@ name: Build Firefox
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ "main", "master" ]
+    inputs:
+      tag:
+        description: 'Upstream tag to build (optional)'
+        required: false
+        type: string
+      force:
+        description: 'Build even if this tag already exists in Releases'
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 */6 * * *'
+
+permissions:
+  contents: write
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      should_sync_release: ${{ steps.check.outputs.should_sync_release }}
+      tag: ${{ steps.check.outputs.tag }}
+      name: ${{ steps.check.outputs.name }}
+      body: ${{ steps.check.outputs.body }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - name: Check upstream release
+        id: check
+        env:
+          UPSTREAM_REPO: violentmonkey/violentmonkey
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ github.event.inputs.force || 'false' }}
+          MANUAL_TAG: ${{ github.event.inputs.tag || '' }}
+        run: |
+          set -euo pipefail
+          api() {
+            curl -sS \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/$1"
+          }
+
+          if [ -n "${MANUAL_TAG:-}" ]; then
+            rel=$(api "repos/$UPSTREAM_REPO/releases/tags/$MANUAL_TAG" || true)
+            if echo "$rel" | jq -e '.message=="Not Found"' >/dev/null 2>&1; then
+              echo "Upstream tag not found: $MANUAL_TAG" >&2
+              exit 1
+            fi
+          else
+            rels=$(api "repos/$UPSTREAM_REPO/releases?per_page=20")
+            rel=$(echo "$rels" | jq 'map(select(
+              .draft==false
+              and .prerelease==false
+              and (.tag_name | test("(rc|beta|alpha)"; "i") | not)
+            )) | .[0]')
+            if [ "$rel" = "null" ]; then
+              echo "No suitable upstream official release found."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          tag=$(echo "$rel" | jq -r '.tag_name')
+          name=$(echo "$rel" | jq -r '.name // .tag_name')
+          body=$(echo "$rel" | jq -r '.body // ""')
+          prerelease=$(echo "$rel" | jq -r '.prerelease')
+
+          existing=$(api "repos/${GITHUB_REPOSITORY}/releases/tags/$tag" || true)
+          exists=false
+          if ! echo "$existing" | jq -e '.message=="Not Found"' >/dev/null 2>&1; then
+            exists=true
+          fi
+
+          should_sync=false
+          if [ "$exists" = "true" ]; then
+            ex_name=$(echo "$existing" | jq -r '.name // .tag_name')
+            ex_body=$(echo "$existing" | jq -r '.body // ""')
+            if [ "$ex_name" != "$name" ] || [ "$ex_body" != "$body" ]; then
+              should_sync=true
+            fi
+          fi
+
+          should=false
+          if [ "$FORCE" = "true" ] || [ "$exists" = "false" ]; then
+            should=true
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "prerelease=$prerelease"
+            echo "name<<__EOF__"
+            echo "$name"
+            echo "__EOF__"
+            echo "body<<__EOF__"
+            echo "$body"
+            echo "__EOF__"
+            echo "should_build=$should"
+            echo "should_sync_release=$should_sync"
+          } >> "$GITHUB_OUTPUT"
+
+  sync_release:
+    runs-on: ubuntu-latest
+    needs: check
+    if: needs.check.outputs.should_sync_release == 'true'
+    steps:
+      - name: Sync release notes
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.tag }}
+          name: ${{ needs.check.outputs.name }}
+          body: ${{ needs.check.outputs.body }}
+          prerelease: ${{ needs.check.outputs.prerelease }}
+
   build:
     runs-on: ubuntu-latest
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
     steps:
       - uses: actions/checkout@v4
 
       - name: Clone upstream
-        run: git clone --depth 1 https://github.com/violentmonkey/violentmonkey upstream
+        run: git clone --depth 1 --branch "${{ needs.check.outputs.tag }}" https://github.com/violentmonkey/violentmonkey upstream
 
       - uses: actions/setup-node@v4
         with:
@@ -44,3 +156,13 @@ jobs:
           name: violentmonkey-firefox
           path: upstream/violentmonkey-firefox.zip
           if-no-files-found: error
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.tag }}
+          name: ${{ needs.check.outputs.name }}
+          body: ${{ needs.check.outputs.body }}
+          prerelease: ${{ needs.check.outputs.prerelease }}
+          files: |
+            upstream/violentmonkey-firefox.zip
