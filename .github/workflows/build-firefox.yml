@@ -173,6 +173,16 @@ jobs:
           ' manifest.json > manifest.json.tmp
           mv manifest.json.tmp manifest.json
 
+      - name: Upload to AMO (unlisted)
+        if: github.event_name == 'schedule'
+        working-directory: upstream/dist
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: |
+          set -euo pipefail
+          npx --yes web-ext@8 sign --channel=unlisted --source-dir . --artifacts-dir ../web-ext-artifacts --no-input
+
       - name: Pack
         working-directory: upstream
         run: |
@@ -185,6 +195,14 @@ jobs:
           name: violentmonkey-firefox
           path: upstream/violentmonkey-firefox.zip
           if-no-files-found: error
+
+      - name: Upload signed XPI artifact
+        if: github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: violentmonkey-firefox-xpi
+          path: upstream/web-ext-artifacts/*.xpi
+          if-no-files-found: warn
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
