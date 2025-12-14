@@ -49,7 +49,8 @@ function applyEdits(text, edits) {
 function loadBabel(upstreamRoot) {
   const requireFromUpstream = createRequire(path.join(upstreamRoot, 'package.json'));
   const babel = requireFromUpstream('@babel/core');
-  return { babel };
+  const generate = requireFromUpstream('@babel/generator').default;
+  return { babel, generate };
 }
 
 function parseJs(babel, code) {
@@ -72,6 +73,19 @@ function parseJs(babel, code) {
       ],
     },
   });
+}
+
+function genNode(generate, node) {
+  return generate(node, {
+    comments: true,
+    compact: false,
+    concise: false,
+    retainLines: false,
+  }).code;
+}
+
+function hasNode(root, predicate) {
+  return !!findFirst(root, predicate);
 }
 
 function parseTs(babel, code) {
@@ -113,59 +127,10 @@ function findFirst(root, predicate) {
   return found;
 }
 
-async function patchPreinject({ upstreamRoot, babel }) {
+async function patchPreinject({ upstreamRoot, babel, generate }) {
   const file = path.join(upstreamRoot, 'src', 'background', 'utils', 'preinject.js');
   const code = await fs.readFile(file, 'utf8');
-  if (code.includes('browser.tabs.get(tabId).catch')
-    && code.includes('const injectOut = IS_FIREFOX && isApplied')
-    && code.includes('if (isApplied && done) return { info: {')) {
-    return false;
-  }
   const eol = detectEol(code);
-
-  // Upgrade an older patched file where MessageSender.tab lacked cookieStoreId
-  if (code.includes('const injectInfo = inject.info || {};')
-    && code.includes('const injectGmi = injectInfo.gmi || {};')
-    && code.includes('const injectOut = container')) {
-    let upgraded = code;
-    const earlyReturnLine = 'if (isApplied && done) return { info: { __proto__: null, gmi: { __proto__: null, container: container } } };';
-    upgraded = upgraded.replace(
-      'const container = IS_FIREFOX && tab.cookieStoreId;',
-      'const container = IS_FIREFOX && isApplied && (tab.cookieStoreId || (await browser.tabs.get(tabId).catch(() => ({}))).cookieStoreId);'
-    );
-    upgraded = upgraded.replace(
-      'const container = IS_FIREFOX && (tab.cookieStoreId || (await browser.tabs.get(tabId)).cookieStoreId);',
-      'const container = IS_FIREFOX && isApplied && (tab.cookieStoreId || (await browser.tabs.get(tabId).catch(() => ({}))).cookieStoreId);'
-    );
-    upgraded = upgraded.replace(
-      'const container = IS_FIREFOX && (tab.cookieStoreId || (await browser.tabs.get(tabId).catch(() => ({}))).cookieStoreId);',
-      'const container = IS_FIREFOX && isApplied && (tab.cookieStoreId || (await browser.tabs.get(tabId).catch(() => ({}))).cookieStoreId);'
-    );
-    upgraded = upgraded.replace('const injectOut = container', 'const injectOut = IS_FIREFOX && isApplied');
-
-    if (!upgraded.includes('if (isApplied && done) return { info: {')) {
-      const mIndent = upgraded.match(/^([ \t]*)const container\b/m);
-      const baseIndent = mIndent ? mIndent[1] : '';
-      const addEarly = (s) => s.replace(
-        /(^[ \t]*: inject;\r?\n)/m,
-        `$1${baseIndent}${earlyReturnLine}${eol}`,
-      );
-      let withEarly = addEarly(upgraded);
-      if (withEarly === upgraded) {
-        withEarly = upgraded.replace(
-          /(^[ \t]*return isApplied\b)/m,
-          `${baseIndent}${earlyReturnLine}${eol}$1`,
-        );
-      }
-      upgraded = withEarly;
-    }
-
-    if (upgraded !== code) {
-      await fs.writeFile(file, upgraded, 'utf8');
-      return true;
-    }
-  }
-
   const ast = parseJs(babel, code);
 
   let targetMethod;
@@ -191,9 +156,27 @@ async function patchPreinject({ upstreamRoot, babel }) {
     throw new PatchError('preinject.js: cannot find return statement "return isApplied ? ..." in GetInjected');
   }
 
-  const indent = getColumnAt(code, returnStmt.start, eol);
+  const bodyStmts = targetMethod.body.body;
+  const findVarStmt = (name) => bodyStmts.find(s => (
+    s.type === 'VariableDeclaration'
+    && s.declarations?.some(d => d.id?.type === 'Identifier' && d.id.name === name)
+  ));
+  const containerStmt = findVarStmt('container');
+  const injectInfoStmt = findVarStmt('injectInfo');
+  const injectGmiStmt = findVarStmt('injectGmi');
+  const injectOutStmt = findVarStmt('injectOut');
+  const earlyReturnStmt = bodyStmts.find(s => (
+    s.type === 'IfStatement'
+    && s.test?.type === 'LogicalExpression'
+    && s.test.operator === '&&'
+    && s.test.left?.type === 'Identifier'
+    && s.test.left.name === 'isApplied'
+    && s.test.right?.type === 'Identifier'
+    && s.test.right.name === 'done'
+    && s.consequent?.type === 'ReturnStatement'
+  ));
 
-  const snippet = [
+  const desiredAst = parseJs(babel, [
     'const container = IS_FIREFOX && isApplied && (tab.cookieStoreId || (await browser.tabs.get(tabId).catch(() => ({}))).cookieStoreId);',
     'const injectInfo = inject.info || {};',
     'const injectGmi = injectInfo.gmi || {};',
@@ -209,47 +192,92 @@ async function patchPreinject({ upstreamRoot, babel }) {
     '  }',
     '  : inject;',
     'if (isApplied && done) return { info: { __proto__: null, gmi: { __proto__: null, container: container } } };',
-  ].join('\n');
-
-  const insertText = indentLines(snippet, indent).replaceAll('\n', eol) + eol;
-
-  const retText = code.slice(returnStmt.start, returnStmt.end);
-  const patchedRetText = retText.replace(/\binject\b/g, 'injectOut');
-
-  const out = applyEdits(code, [
-    { start: returnStmt.start, end: returnStmt.start, replacement: insertText },
-    { start: returnStmt.start, end: returnStmt.end, replacement: patchedRetText },
+    '',
+  ].join('\n')).program.body;
+  const desiredByName = Object.fromEntries([
+    ['container', desiredAst[0]],
+    ['injectInfo', desiredAst[1]],
+    ['injectGmi', desiredAst[2]],
+    ['injectOut', desiredAst[3]],
+    ['earlyReturn', desiredAst[4]],
   ]);
+
+  const edits = [];
+  const indent = getColumnAt(code, returnStmt.start, eol);
+  const toEol = (s) => s.replaceAll('\n', eol);
+
+  const stmtLooksOk = (stmt, name) => {
+    if (!stmt) return false;
+    if (name === 'container') {
+      return hasNode(stmt, n => n.type === 'Identifier' && n.name === 'isApplied')
+        && hasNode(stmt, n => n.type === 'Identifier' && n.name === 'tabId')
+        && hasNode(stmt, n => n.type === 'Identifier' && n.name === 'cookieStoreId')
+        && hasNode(stmt, n => n.type === 'MemberExpression'
+          && !n.computed
+          && n.object?.type === 'Identifier'
+          && n.object.name === 'browser'
+          && n.property?.type === 'Identifier'
+          && n.property.name === 'tabs')
+        && hasNode(stmt, n => n.type === 'Identifier' && n.name === 'catch');
+    }
+    if (name === 'injectOut') {
+      return hasNode(stmt, n => n.type === 'Identifier' && n.name === 'injectGmi')
+        && hasNode(stmt, n => n.type === 'Identifier' && n.name === 'container');
+    }
+    if (name === 'earlyReturn') {
+      return hasNode(stmt, n => n.type === 'Identifier' && n.name === 'done')
+        && hasNode(stmt, n => n.type === 'Identifier' && n.name === 'container');
+    }
+    return true;
+  };
+
+  const maybeReplaceStmt = (existing, desired, name) => {
+    if (!existing) return;
+    if (stmtLooksOk(existing, name)) return;
+    const rep = toEol(genNode(generate, desired));
+    edits.push({ start: existing.start, end: existing.end, replacement: rep });
+  };
+  maybeReplaceStmt(containerStmt, desiredByName.container, 'container');
+  maybeReplaceStmt(injectInfoStmt, desiredByName.injectInfo, 'injectInfo');
+  maybeReplaceStmt(injectGmiStmt, desiredByName.injectGmi, 'injectGmi');
+  maybeReplaceStmt(injectOutStmt, desiredByName.injectOut, 'injectOut');
+  maybeReplaceStmt(earlyReturnStmt, desiredByName.earlyReturn, 'earlyReturn');
+
+  const insertStmts = [];
+  if (!containerStmt) insertStmts.push(desiredByName.container);
+  if (!injectInfoStmt) insertStmts.push(desiredByName.injectInfo);
+  if (!injectGmiStmt) insertStmts.push(desiredByName.injectGmi);
+  if (!injectOutStmt) insertStmts.push(desiredByName.injectOut);
+  if (!earlyReturnStmt) insertStmts.push(desiredByName.earlyReturn);
+  if (insertStmts.length) {
+    const insertText = indentLines(
+      insertStmts.map(s => genNode(generate, s)).join('\n'),
+      indent,
+    ).replaceAll('\n', eol) + eol;
+    edits.push({ start: returnStmt.start, end: returnStmt.start, replacement: insertText });
+  }
+
+  const replaceInNode = (node) => {
+    walk(node, (n) => {
+      if (n.type === 'Identifier' && n.name === 'inject') n.name = 'injectOut';
+      return undefined;
+    });
+  };
+  const retNode = returnStmt.argument;
+  replaceInNode(retNode);
+  const patchedRetText = toEol(genNode(generate, returnStmt));
+  edits.push({ start: returnStmt.start, end: returnStmt.end, replacement: patchedRetText });
+
+  const out = applyEdits(code, edits);
+  if (out === code) return false;
   await fs.writeFile(file, out, 'utf8');
   return true;
 }
 
-async function patchContentIndex({ upstreamRoot, babel }) {
+async function patchContentIndex({ upstreamRoot, babel, generate }) {
   const file = path.join(upstreamRoot, 'src', 'injected', 'content', 'index.js');
   const code = await fs.readFile(file, 'utf8');
-  if (code.includes("if (IS_FIREFOX && info && (!info.gmi || !('container' in info.gmi)))")
-    && code.includes('const extra = await dataPromise;')
-    && code.includes('const extraGmi = extra && extra.info && extra.info.gmi;')
-    && code.includes('if (extraGmi) info.gmi = assign(info.gmi || createNullObj(), extraGmi);')
-    && code.includes('} catch (e) { void e; }')) {
-    return false;
-  }
   const eol = detectEol(code);
-
-  // Upgrade older variants that used an empty catch block, which violates eslint no-empty.
-  {
-    const upgraded = code.replace(
-      /\}\s*catch\s*\(e\)\s*\{\s*\}\s*\n\s*\}/m,
-      '} catch (e) { void e; }\n}',
-    );
-    if (upgraded !== code
-      && upgraded.includes('const extra = await dataPromise;')
-      && upgraded.includes("!('container' in info.gmi)")) {
-      await fs.writeFile(file, upgraded, 'utf8');
-      return true;
-    }
-  }
-
   const ast = parseJs(babel, code);
 
   const initFn = findFirst(ast, n => (
@@ -276,8 +304,11 @@ async function patchContentIndex({ upstreamRoot, babel }) {
     throw new PatchError('content/index.js: cannot find statement "const info = data.info;"');
   }
 
-  const indent = getColumnAt(code, infoStmt.start, eol);
-  const snippet = [
+  const bodyStmts = initFn.body.body;
+  const idx = bodyStmts.indexOf(infoStmt);
+  const next = idx >= 0 ? bodyStmts[idx + 1] : null;
+
+  const desiredIfAst = parseJs(babel, [
     "if (IS_FIREFOX && info && (!info.gmi || !('container' in info.gmi))) {",
     '  try {',
     '    const extra = await dataPromise;',
@@ -285,24 +316,33 @@ async function patchContentIndex({ upstreamRoot, babel }) {
     '    if (extraGmi) info.gmi = assign(info.gmi || createNullObj(), extraGmi);',
     '  } catch (e) { void e; }',
     '}',
-  ].join('\n');
-  const insertText = eol + indentLines(snippet, indent).replaceAll('\n', eol) + eol;
+  ].join('\n')).program.body[0];
 
-  const out = applyEdits(code, [{
-    start: infoStmt.end,
-    end: infoStmt.end,
-    replacement: insertText,
-  }]);
+  const isOurIf = (stmt) => stmt?.type === 'IfStatement'
+    && hasNode(stmt, n => n.type === 'StringLiteral' && n.value === 'container');
+
+  if (isOurIf(next)) {
+    const desiredText = genNode(generate, desiredIfAst).replaceAll('\n', eol);
+    const currentOk = hasNode(next, n => n.type === 'UnaryExpression'
+      && n.operator === 'void'
+      && n.argument?.type === 'Identifier'
+      && n.argument.name === 'e');
+    if (currentOk) return false;
+    const out = applyEdits(code, [{ start: next.start, end: next.end, replacement: desiredText }]);
+    await fs.writeFile(file, out, 'utf8');
+    return true;
+  }
+
+  const indent = getColumnAt(code, infoStmt.start, eol);
+  const insertText = eol + indentLines(genNode(generate, desiredIfAst), indent).replaceAll('\n', eol) + eol;
+  const out = applyEdits(code, [{ start: infoStmt.end, end: infoStmt.end, replacement: insertText }]);
   await fs.writeFile(file, out, 'utf8');
   return true;
 }
 
-async function patchInject({ upstreamRoot, babel }) {
+async function patchInject({ upstreamRoot, babel, generate }) {
   const file = path.join(upstreamRoot, 'src', 'injected', 'content', 'inject.js');
   const code = await fs.readFile(file, 'utf8');
-  if (code.includes('info.gmi = assign(info.gmi || createNullObj(),')) {
-    return false;
-  }
   const eol = detectEol(code);
   const ast = parseJs(babel, code);
 
@@ -326,22 +366,41 @@ async function patchInject({ upstreamRoot, babel }) {
     if (propName !== 'gmi') return false;
     if (n.right.type === 'CallExpression'
       && n.right.callee.type === 'Identifier'
-      && n.right.callee.name === 'assign') return false;
-    if (n.right.type !== 'ObjectExpression') return false;
-    return true;
+      && n.right.callee.name === 'assign') {
+      const a0 = n.right.arguments?.[0];
+      return !(a0?.type === 'LogicalExpression'
+        && a0.operator === '||'
+        && a0.left?.type === 'MemberExpression'
+        && a0.left.object?.type === 'Identifier'
+        && a0.left.object.name === 'info'
+        && a0.left.property?.type === 'Identifier'
+        && a0.left.property.name === 'gmi'
+        && a0.right?.type === 'CallExpression'
+        && a0.right.callee?.type === 'Identifier'
+        && a0.right.callee.name === 'createNullObj');
+    }
+    return n.right.type === 'ObjectExpression';
   });
 
   if (!assignExpr) {
     throw new PatchError('inject.js: cannot find assignment "info.gmi = { ... }" in injectScripts');
   }
 
-  const objText = code.slice(assignExpr.right.start, assignExpr.right.end);
-  const replacement = `assign(info.gmi || createNullObj(), ${objText})`;
+  if (assignExpr.right.type === 'CallExpression'
+    && assignExpr.right.callee.type === 'Identifier'
+    && assignExpr.right.callee.name === 'assign') {
+    return false;
+  }
+
+  const desiredExprAst = parseJs(babel, 'assign(info.gmi || createNullObj(), {});')
+    .program.body[0].expression;
+  desiredExprAst.arguments[1] = assignExpr.right; // reuse original object literal
+  const replacement = genNode(generate, desiredExprAst).replaceAll('\n', eol);
 
   const out = applyEdits(code, [{
     start: assignExpr.right.start,
     end: assignExpr.right.end,
-    replacement: replacement.replaceAll('\n', eol),
+    replacement: replacement,
   }]);
 
   await fs.writeFile(file, out, 'utf8');
@@ -351,9 +410,6 @@ async function patchInject({ upstreamRoot, babel }) {
 async function patchTypes({ upstreamRoot, babel }) {
   const file = path.join(upstreamRoot, 'src', 'types.d.ts');
   const code = await fs.readFile(file, 'utf8');
-  if (code.includes('container?: string;')) {
-    return false;
-  }
   const eol = detectEol(code);
   const ast = parseTs(babel, code);
 
@@ -415,16 +471,16 @@ async function main() {
   const upstreamRootArg = process.argv[2] || 'upstream';
   const upstreamRoot = path.resolve(process.cwd(), upstreamRootArg);
 
-  const { babel } = loadBabel(upstreamRoot);
+  const { babel, generate } = loadBabel(upstreamRoot);
 
   const changed = [];
-  if (await patchPreinject({ upstreamRoot, babel })) {
+  if (await patchPreinject({ upstreamRoot, babel, generate })) {
     changed.push('src/background/utils/preinject.js');
   }
-  if (await patchContentIndex({ upstreamRoot, babel })) {
+  if (await patchContentIndex({ upstreamRoot, babel, generate })) {
     changed.push('src/injected/content/index.js');
   }
-  if (await patchInject({ upstreamRoot, babel })) {
+  if (await patchInject({ upstreamRoot, babel, generate })) {
     changed.push('src/injected/content/inject.js');
   }
   if (await patchTypes({ upstreamRoot, babel })) {
