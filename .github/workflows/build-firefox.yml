@@ -90,7 +90,9 @@ jobs:
           fi
 
           should=false
-          if [ "$FORCE" = "true" ] || [ "$exists" = "false" ]; then
+          if [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ]; then
+            should=true
+          elif [ "$FORCE" = "true" ] || [ "$exists" = "false" ]; then
             should=true
           fi
 
