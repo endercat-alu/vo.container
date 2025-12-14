@@ -144,6 +144,26 @@ jobs:
         run: |
           yarn build
 
+      - name: Add Firefox data_collection_permissions
+        working-directory: upstream/dist
+        run: |
+          set -euo pipefail
+          test -f manifest.json
+          jq '
+            .browser_specific_settings = (.browser_specific_settings // {})
+            | .browser_specific_settings.gecko = (.browser_specific_settings.gecko // {})
+            | .browser_specific_settings.gecko.data_collection_permissions = (.browser_specific_settings.gecko.data_collection_permissions // {})
+            | .browser_specific_settings.gecko.data_collection_permissions.required = (
+                (.browser_specific_settings.gecko.data_collection_permissions.required // ["none"])
+                | if (type=="array" and length==0) then ["none"] else . end
+              )
+            | .browser_specific_settings.gecko.data_collection_permissions.optional = (
+                (.browser_specific_settings.gecko.data_collection_permissions.optional // [])
+                | if (type=="array") then . else [] end
+              )
+          ' manifest.json > manifest.json.tmp
+          mv manifest.json.tmp manifest.json
+
       - name: Pack
         working-directory: upstream
         run: |
