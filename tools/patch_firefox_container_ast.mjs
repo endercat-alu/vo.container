@@ -116,10 +116,56 @@ function findFirst(root, predicate) {
 async function patchPreinject({ upstreamRoot, babel }) {
   const file = path.join(upstreamRoot, 'src', 'background', 'utils', 'preinject.js');
   const code = await fs.readFile(file, 'utf8');
-  if (code.includes('const container = IS_FIREFOX && tab.cookieStoreId;')) {
+  if (code.includes('browser.tabs.get(tabId).catch')
+    && code.includes('const injectOut = IS_FIREFOX && isApplied')
+    && code.includes('if (isApplied && done) return { info: {')) {
     return false;
   }
   const eol = detectEol(code);
+
+  // Upgrade an older patched file where MessageSender.tab lacked cookieStoreId
+  if (code.includes('const injectInfo = inject.info || {};')
+    && code.includes('const injectGmi = injectInfo.gmi || {};')
+    && code.includes('const injectOut = container')) {
+    let upgraded = code;
+    const earlyReturnLine = 'if (isApplied && done) return { info: { __proto__: null, gmi: { __proto__: null, container: container } } };';
+    upgraded = upgraded.replace(
+      'const container = IS_FIREFOX && tab.cookieStoreId;',
+      'const container = IS_FIREFOX && isApplied && (tab.cookieStoreId || (await browser.tabs.get(tabId).catch(() => ({}))).cookieStoreId);'
+    );
+    upgraded = upgraded.replace(
+      'const container = IS_FIREFOX && (tab.cookieStoreId || (await browser.tabs.get(tabId)).cookieStoreId);',
+      'const container = IS_FIREFOX && isApplied && (tab.cookieStoreId || (await browser.tabs.get(tabId).catch(() => ({}))).cookieStoreId);'
+    );
+    upgraded = upgraded.replace(
+      'const container = IS_FIREFOX && (tab.cookieStoreId || (await browser.tabs.get(tabId).catch(() => ({}))).cookieStoreId);',
+      'const container = IS_FIREFOX && isApplied && (tab.cookieStoreId || (await browser.tabs.get(tabId).catch(() => ({}))).cookieStoreId);'
+    );
+    upgraded = upgraded.replace('const injectOut = container', 'const injectOut = IS_FIREFOX && isApplied');
+
+    if (!upgraded.includes('if (isApplied && done) return { info: {')) {
+      const mIndent = upgraded.match(/^([ \t]*)const container\b/m);
+      const baseIndent = mIndent ? mIndent[1] : '';
+      const addEarly = (s) => s.replace(
+        /(^[ \t]*: inject;\r?\n)/m,
+        `$1${baseIndent}${earlyReturnLine}${eol}`,
+      );
+      let withEarly = addEarly(upgraded);
+      if (withEarly === upgraded) {
+        withEarly = upgraded.replace(
+          /(^[ \t]*return isApplied\b)/m,
+          `${baseIndent}${earlyReturnLine}${eol}$1`,
+        );
+      }
+      upgraded = withEarly;
+    }
+
+    if (upgraded !== code) {
+      await fs.writeFile(file, upgraded, 'utf8');
+      return true;
+    }
+  }
+
   const ast = parseJs(babel, code);
 
   let targetMethod;
@@ -148,20 +194,21 @@ async function patchPreinject({ upstreamRoot, babel }) {
   const indent = getColumnAt(code, returnStmt.start, eol);
 
   const snippet = [
-    'const container = IS_FIREFOX && tab.cookieStoreId;',
+    'const container = IS_FIREFOX && isApplied && (tab.cookieStoreId || (await browser.tabs.get(tabId).catch(() => ({}))).cookieStoreId);',
     'const injectInfo = inject.info || {};',
     'const injectGmi = injectInfo.gmi || {};',
-    'const injectOut = container',
+    'const injectOut = IS_FIREFOX && isApplied',
     '  ? {',
     '    __proto__: null,',
     '    ...inject,',
     '    info: {',
     '      __proto__: null,',
     '      ...injectInfo,',
-    '      gmi: { __proto__: null, ...injectGmi, container },',
+    '      gmi: { __proto__: null, ...injectGmi, container: container },',
     '    },',
     '  }',
     '  : inject;',
+    'if (isApplied && done) return { info: { __proto__: null, gmi: { __proto__: null, container: container } } };',
   ].join('\n');
 
   const insertText = indentLines(snippet, indent).replaceAll('\n', eol) + eol;
@@ -173,6 +220,60 @@ async function patchPreinject({ upstreamRoot, babel }) {
     { start: returnStmt.start, end: returnStmt.start, replacement: insertText },
     { start: returnStmt.start, end: returnStmt.end, replacement: patchedRetText },
   ]);
+  await fs.writeFile(file, out, 'utf8');
+  return true;
+}
+
+async function patchContentIndex({ upstreamRoot, babel }) {
+  const file = path.join(upstreamRoot, 'src', 'injected', 'content', 'index.js');
+  const code = await fs.readFile(file, 'utf8');
+  if (code.includes("!('container' in info.gmi)") && code.includes('await dataPromise')) {
+    return false;
+  }
+  const eol = detectEol(code);
+  const ast = parseJs(babel, code);
+
+  const initFn = findFirst(ast, n => (
+    n.type === 'FunctionDeclaration'
+    && n.id?.type === 'Identifier'
+    && n.id.name === 'init'
+  ));
+  if (!initFn) {
+    throw new PatchError('content/index.js: cannot find function init');
+  }
+
+  const infoStmt = initFn.body.body.find(s => {
+    if (s.type !== 'VariableDeclaration') return false;
+    const d = s.declarations?.[0];
+    if (!d || d.id?.type !== 'Identifier' || d.id.name !== 'info') return false;
+    const init = d.init;
+    return init?.type === 'MemberExpression'
+      && init.object?.type === 'Identifier'
+      && init.object.name === 'data'
+      && init.property?.type === 'Identifier'
+      && init.property.name === 'info';
+  });
+  if (!infoStmt) {
+    throw new PatchError('content/index.js: cannot find statement "const info = data.info;"');
+  }
+
+  const indent = getColumnAt(code, infoStmt.start, eol);
+  const snippet = [
+    "if (IS_FIREFOX && info && (!info.gmi || !('container' in info.gmi))) {",
+    '  try {',
+    '    const extra = await dataPromise;',
+    '    const extraGmi = extra && extra.info && extra.info.gmi;',
+    '    if (extraGmi) info.gmi = assign(info.gmi || createNullObj(), extraGmi);',
+    '  } catch (e) {}',
+    '}',
+  ].join('\n');
+  const insertText = eol + indentLines(snippet, indent).replaceAll('\n', eol) + eol;
+
+  const out = applyEdits(code, [{
+    start: infoStmt.end,
+    end: infoStmt.end,
+    replacement: insertText,
+  }]);
   await fs.writeFile(file, out, 'utf8');
   return true;
 }
@@ -300,6 +401,9 @@ async function main() {
   const changed = [];
   if (await patchPreinject({ upstreamRoot, babel })) {
     changed.push('src/background/utils/preinject.js');
+  }
+  if (await patchContentIndex({ upstreamRoot, babel })) {
+    changed.push('src/injected/content/index.js');
   }
   if (await patchInject({ upstreamRoot, babel })) {
     changed.push('src/injected/content/inject.js');
