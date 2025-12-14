@@ -227,10 +227,29 @@ async function patchPreinject({ upstreamRoot, babel }) {
 async function patchContentIndex({ upstreamRoot, babel }) {
   const file = path.join(upstreamRoot, 'src', 'injected', 'content', 'index.js');
   const code = await fs.readFile(file, 'utf8');
-  if (code.includes("!('container' in info.gmi)") && code.includes('await dataPromise')) {
+  if (code.includes("if (IS_FIREFOX && info && (!info.gmi || !('container' in info.gmi)))")
+    && code.includes('const extra = await dataPromise;')
+    && code.includes('const extraGmi = extra && extra.info && extra.info.gmi;')
+    && code.includes('if (extraGmi) info.gmi = assign(info.gmi || createNullObj(), extraGmi);')
+    && code.includes('} catch (e) { void e; }')) {
     return false;
   }
   const eol = detectEol(code);
+
+  // Upgrade older variants that used an empty catch block, which violates eslint no-empty.
+  {
+    const upgraded = code.replace(
+      /\}\s*catch\s*\(e\)\s*\{\s*\}\s*\n\s*\}/m,
+      '} catch (e) { void e; }\n}',
+    );
+    if (upgraded !== code
+      && upgraded.includes('const extra = await dataPromise;')
+      && upgraded.includes("!('container' in info.gmi)")) {
+      await fs.writeFile(file, upgraded, 'utf8');
+      return true;
+    }
+  }
+
   const ast = parseJs(babel, code);
 
   const initFn = findFirst(ast, n => (
@@ -264,7 +283,7 @@ async function patchContentIndex({ upstreamRoot, babel }) {
     '    const extra = await dataPromise;',
     '    const extraGmi = extra && extra.info && extra.info.gmi;',
     '    if (extraGmi) info.gmi = assign(info.gmi || createNullObj(), extraGmi);',
-    '  } catch (e) {}',
+    '  } catch (e) { void e; }',
     '}',
   ].join('\n');
   const insertText = eol + indentLines(snippet, indent).replaceAll('\n', eol) + eol;
