@@ -7,6 +7,10 @@ on:
         description: 'Upstream tag to build (optional)'
         required: false
         type: string
+      addon_id:
+        description: 'Firefox Add-on ID to avoid conflict (optional)'
+        required: false
+        type: string
       force:
         description: 'Build even if this tag already exists in Releases'
         required: false
@@ -146,12 +150,15 @@ jobs:
 
       - name: Add Firefox data_collection_permissions
         working-directory: upstream/dist
+        env:
+          ADDON_ID: ${{ github.event.inputs.addon_id || format('violentmonkey-patched-{0}@github-actions.local', github.repository_owner) }}
         run: |
           set -euo pipefail
           test -f manifest.json
           jq '
             .browser_specific_settings = (.browser_specific_settings // {})
             | .browser_specific_settings.gecko = (.browser_specific_settings.gecko // {})
+            | .browser_specific_settings.gecko.id = (env.ADDON_ID)
             | .browser_specific_settings.gecko.data_collection_permissions = (.browser_specific_settings.gecko.data_collection_permissions // {})
             | .browser_specific_settings.gecko.data_collection_permissions.required = (
                 (.browser_specific_settings.gecko.data_collection_permissions.required // ["none"])
